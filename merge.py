@@ -323,6 +323,90 @@ def write_sylt_to_output(output_path: Path, sylt_data, lang="chi"):
         print(f"  错误：写入 SYLT 失败 - {e}")
 
 
+def sanitize_chapter_tag(output_path: Path) -> None:
+    """把章节标签整理成 ID3v2.3，并把 CHAP 帧按时间重排。
+
+    ffmpeg 写 ID3v2.4 时，帧体超过 127 字节的 CHAP 帧会写入非 synchsafe 的
+    长度字段，严格按规范解析的读取器（网页播放器、ffmpeg 自身等）会中途错位、
+    丢章节并把标题回退成占位名。ID3v2.3 的帧长度是大端，各读取器都能正确解析。
+    """
+    try:
+        tags = ID3(output_path)
+    except Exception:
+        return
+    if not tags.getall("CHAP"):
+        return
+    try:
+        tags.save(output_path, v2_version=3)
+    except Exception as exc:
+        print(f"  警告：重写章节标签失败 - {exc}")
+        return
+    try:
+        _reorder_chap_frames(output_path)
+    except Exception as exc:
+        print(f"  警告：章节排序失败 - {exc}")
+
+
+def _synchsafe(value: int) -> bytes:
+    return bytes([(value >> 21) & 0x7F, (value >> 14) & 0x7F,
+                  (value >> 7) & 0x7F, value & 0x7F])
+
+
+def _reorder_chap_frames(path: Path) -> None:
+    """按章节起始时间重排文件里的 CHAP 帧，供按帧顺序枚举的工具使用。"""
+    raw = path.read_bytes()
+    if raw[:3] != b"ID3" or len(raw) < 10:
+        return
+    tag_size = 0
+    for b in raw[6:10]:
+        tag_size = (tag_size << 7) | (b & 0x7F)
+    end = 10 + tag_size
+    if end > len(raw):
+        return
+
+    spans = []
+    pos = 10
+    while pos + 10 <= end:
+        frame_id = raw[pos:pos + 4]
+        if not re.fullmatch(rb"[A-Z0-9]{4}", frame_id):
+            break
+        size = int.from_bytes(raw[pos + 4:pos + 8], "big")
+        if size <= 0 or pos + 10 + size > end:
+            break
+        spans.append((pos, pos + 10 + size, frame_id))
+        pos += 10 + size
+    if pos != end:
+        return
+
+    chap_spans = [s for s in spans if s[2] == b"CHAP"]
+    if len(chap_spans) < 2:
+        return
+
+    def start_ms(span) -> int:
+        body = raw[span[0] + 10:span[1]]
+        nul = body.find(b"\x00")
+        return int.from_bytes(body[nul + 1:nul + 5], "big") if nul >= 0 else 0
+
+    ordered = sorted(chap_spans, key=start_ms)
+    if [s[0] for s in ordered] == [s[0] for s in chap_spans]:
+        return
+
+    blobs = [raw[s:e] for s, e, _ in ordered]
+    body = bytearray()
+    index = 0
+    for s, e, frame_id in spans:
+        if frame_id == b"CHAP":
+            body += blobs[index]
+            index += 1
+        else:
+            body += raw[s:e]
+
+    tmp = path.with_name(path.name + ".chaptmp")
+    tmp.write_bytes(b"ID3" + raw[3:5] + bytes([raw[5]]) + _synchsafe(len(body))
+                    + bytes(body) + raw[end:])
+    tmp.replace(path)
+
+
 # ---------------- 命令行入口 ----------------
 
 def parse_args():
@@ -522,11 +606,15 @@ def main():
 
         # ---- 合并歌词为 SYLT ----
         if args.no_lyrics:
+            sanitize_chapter_tag(output_path)
             return
         print("\n正在处理歌词（SYLT）...")
         sylt_data = build_sylt_data(mp3_files, chapters,
                                     with_markers=args.chapter_markers)
         write_sylt_to_output(output_path, sylt_data, lang=args.lyrics_lang)
+
+        # ---- 统一章节标签（ID3v2.3 + CHAP 按时间排序）----
+        sanitize_chapter_tag(output_path)
     finally:
         metadata_path.unlink(missing_ok=True)
         concat_list_path.unlink(missing_ok=True)

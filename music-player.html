@@ -2447,6 +2447,28 @@ body.dark-mode .card.fullscreen{
            ((bytes[offset+2] & 0x7f) << 7) |
            (bytes[offset+3] & 0x7f);
   }
+  /* 有的工具（例如 ffmpeg）写 ID3v2.4 时会把个别帧长度写成普通大端，
+     这里两种读法都试一次，取能落到下一个合法帧头的那一个。 */
+  function looksLikeFrameStart(bytes, at, limit) {
+    if (at === limit || at + 10 > limit) return true;
+    var id = String.fromCharCode(bytes[at], bytes[at+1], bytes[at+2], bytes[at+3]);
+    return /^[A-Z0-9]{4}$/.test(id);
+  }
+  function frameSizeAt(bytes, pos, version, tagEnd) {
+    var sync = readSyncSafeUint32(bytes, pos + 4);
+    var plain = readUint32BE(bytes, pos + 4);
+    var primary = version === 4 ? sync : plain;
+    var fallback = version === 4 ? plain : sync;
+    if (primary > 0 && pos + 10 + primary <= tagEnd &&
+        looksLikeFrameStart(bytes, pos + 10 + primary, tagEnd)) {
+      return primary;
+    }
+    if (fallback > 0 && pos + 10 + fallback <= tagEnd &&
+        looksLikeFrameStart(bytes, pos + 10 + fallback, tagEnd)) {
+      return fallback;
+    }
+    return primary;
+  }
   function parseChapters(arrayBuffer) {
     var bytes = new Uint8Array(arrayBuffer);
     if (bytes.length < 10 ||
@@ -2461,14 +2483,12 @@ body.dark-mode .card.fullscreen{
     while (pos + 10 <= tagEnd) {
       var frameId = String.fromCharCode(bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]);
       if (!/^[A-Z0-9]{4}$/.test(frameId)) break;
-      var frameSize;
-      if (version === 4) frameSize = readSyncSafeUint32(bytes, pos + 4);
-      else frameSize = readUint32BE(bytes, pos + 4);
+      var frameSize = frameSizeAt(bytes, pos, version, tagEnd);
       if (frameSize <= 0 || pos + 10 + frameSize > tagEnd) break;
       var frameDataStart = pos + 10;
       if (frameId === 'CHAP') {
         try {
-          var chap = parseChapFrame(bytes, frameDataStart, frameSize);
+          var chap = parseChapFrame(bytes, frameDataStart, frameSize, version);
           if (chap) found.push(chap);
         } catch (e) {}
       }
@@ -2482,7 +2502,7 @@ body.dark-mode .card.fullscreen{
     }
     return found;
   }
-  function parseChapFrame(bytes, start, size) {
+  function parseChapFrame(bytes, start, size, version) {
     var end = start + size;
     var p = start;
     var idStart = p;
@@ -2497,7 +2517,16 @@ body.dark-mode .card.fullscreen{
     while (p + 10 <= end) {
       var subId = String.fromCharCode(bytes[p], bytes[p+1], bytes[p+2], bytes[p+3]);
       if (!/^[A-Z0-9]{4}$/.test(subId)) break;
-      var subSize = readUint32BE(bytes, p + 4);
+      var subSize;
+      if (version === 4) {
+        subSize = readSyncSafeUint32(bytes, p + 4);
+        if (subSize <= 0 || p + 10 + subSize > end) {
+          var subPlain = readUint32BE(bytes, p + 4);
+          if (subPlain > 0 && p + 10 + subPlain <= end) subSize = subPlain;
+        }
+      } else {
+        subSize = readUint32BE(bytes, p + 4);
+      }
       if (subSize <= 0 || p + 10 + subSize > end) break;
       if (subId === 'TIT2') {
         title = decodeTextFrame(bytes, p + 10, subSize);
