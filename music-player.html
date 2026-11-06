@@ -117,7 +117,7 @@ input[type=text]:focus{border-color:var(--accent)}
 
 .add-item{
   width:100%;margin-bottom:0;text-align:left;
-  border-color:var(--accent);background:#fff;
+  background:#fff;
   font-family:inherit;font-size:inherit;color:inherit;
   -webkit-appearance:none;appearance:none;
 }
@@ -131,7 +131,7 @@ input[type=text]:focus{border-color:var(--accent)}
 
 .favorites-card{
   width:100%;text-align:left;line-height:1.4;
-  border-color:var(--accent);background:#fff;
+  background:#fff;
   font-family:inherit;font-size:inherit;color:inherit;
   -webkit-appearance:none;appearance:none;
 }
@@ -536,6 +536,8 @@ body.fs-collapse .right-top{overflow:hidden}
 .chapter-item.active{border-color:var(--accent);background:var(--accent-soft)}
 .chapter-item:active{opacity:.85}
 .chapter-title{flex:1;min-width:0;font-size:14px;color:#222;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chapter-item.favorited .chapter-title,
+.favorite-item .chapter-title{color:var(--accent)}
 .chapter-main{flex:1;min-width:0;display:flex;align-items:baseline;gap:6px}
 .chapter-main .chapter-title{flex:0 1 auto;max-width:60%}
 .chapter-main .chapter-sub{flex:1 1 0;min-width:0;margin-top:0}
@@ -627,11 +629,11 @@ body.dark-mode .item-menu-btn{color:#e9ecf2}
 body.dark-mode .item-menu-btn:active{background:#2c313c}
 body.dark-mode .item-menu-btn.danger{color:#ff6b6b}
 
-body.dark-mode .add-item{background:#1e1e1e;border-color:var(--accent)}
+body.dark-mode .add-item{background:#1e1e1e}
 body.dark-mode .add-item .name{color:var(--accent-light)}
 body.dark-mode .add-item .path{color:var(--accent-dim)}
 body.dark-mode .add-icon{color:var(--accent-light)}
-body.dark-mode .favorites-card{background:#1e1e1e;border-color:var(--accent)}
+body.dark-mode .favorites-card{background:#1e1e1e}
 body.dark-mode .favorites-card .name{color:var(--accent-light)}
 body.dark-mode .favorites-card .path{color:var(--accent-dim)}
 
@@ -697,6 +699,8 @@ body.dark-mode .chapter-section h3 b{color:#e9ecf2}
 body.dark-mode .chapter-item{background:#1e1e1e;border-color:#2c313c}
 body.dark-mode .chapter-item.active{background:var(--accent-soft-dark);border-color:var(--accent)}
 body.dark-mode .chapter-title{color:#e9ecf2}
+body.dark-mode .chapter-item.favorited .chapter-title,
+body.dark-mode .favorite-item .chapter-title{color:var(--accent-light)}
 body.dark-mode .chapter-sub{color:#8a91a3}
 body.dark-mode .chapter-main .chapter-sub::before{color:#6d7482}
 body.dark-mode .chapter-time{color:#8a91a3}
@@ -982,6 +986,8 @@ body.dark-mode .card.fullscreen{
   var favorites = [];
   var favoritesView = false;
   var favoritesPlayback = false;
+  var favoriteShuffleQueue = [];
+  var favoriteShufflePos = -1;
   var chapterCache = {};
   var chapterLoads = {};
   var chapterCacheOrder = [];
@@ -1887,6 +1893,8 @@ body.dark-mode .card.fullscreen{
         });
       });
     } catch (e) { favorites = []; }
+    favoriteShuffleQueue = [];
+    favoriteShufflePos = -1;
   }
   function saveFavorites() {
     try {
@@ -1983,15 +1991,83 @@ body.dark-mode .card.fullscreen{
     }
     return null;
   }
+  function isChapterFavorited(trackId, src, startMs) {
+    if (findFavorite(trackId, startMs)) return true;
+    if (src) {
+      for (var i = 0; i < favorites.length; i++) {
+        if (favorites[i].src === src &&
+            Math.abs(favorites[i].startMs - startMs) <= 50) return true;
+      }
+    }
+    return false;
+  }
+  /* 收藏列表的随机播放：与专辑一致，使用 Fisher-Yates 洗牌队列 */
+  function buildFavoriteShuffleQueue(startIndex) {
+    var n = favorites.length;
+    var arr = [];
+    for (var i = 0; i < n; i++) arr.push(i);
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+    }
+    if (startIndex != null && startIndex >= 0 && startIndex < n) {
+      var pos = arr.indexOf(startIndex);
+      if (pos > 0) { arr.splice(pos, 1); arr.unshift(startIndex); }
+      favoriteShuffleQueue = arr;
+      favoriteShufflePos = 0;
+    } else {
+      favoriteShuffleQueue = arr;
+      favoriteShufflePos = -1;
+    }
+  }
+  function syncFavoriteShufflePosition(idx) {
+    if (currentMode() !== 'shuffle' || idx < 0) return;
+    if (favoriteShuffleQueue.length === favorites.length) {
+      var pos = favoriteShuffleQueue.indexOf(idx);
+      if (pos >= 0) { favoriteShufflePos = pos; return; }
+    }
+    buildFavoriteShuffleQueue(idx);
+  }
+  function getFavoriteShuffleIndex(dir) {
+    var n = favorites.length;
+    if (n === 0) return -1;
+    var cur = currentFavoriteIndex();
+    if (favoriteShuffleQueue.length !== n) {
+      buildFavoriteShuffleQueue(cur);
+    } else if (cur >= 0) {
+      var curPos = favoriteShuffleQueue.indexOf(cur);
+      if (curPos < 0) buildFavoriteShuffleQueue(cur);
+      else favoriteShufflePos = curPos;
+    }
+    if (dir > 0) {
+      if (favoriteShufflePos < favoriteShuffleQueue.length - 1) {
+        favoriteShufflePos++;
+        return favoriteShuffleQueue[favoriteShufflePos];
+      }
+      buildFavoriteShuffleQueue(null);
+      favoriteShufflePos = 0;
+      if (favoriteShuffleQueue.length > 1 && favoriteShuffleQueue[0] === cur) {
+        var swapIdx = 1 + Math.floor(Math.random() * (favoriteShuffleQueue.length - 1));
+        var tmp = favoriteShuffleQueue[0];
+        favoriteShuffleQueue[0] = favoriteShuffleQueue[swapIdx];
+        favoriteShuffleQueue[swapIdx] = tmp;
+      }
+      return favoriteShuffleQueue[0];
+    }
+    if (favoriteShufflePos > 0) {
+      favoriteShufflePos--;
+      return favoriteShuffleQueue[favoriteShufflePos];
+    }
+    return -1;
+  }
   function playFavoriteByOffset(dir) {
     var idx = currentFavoriteIndex();
     if (idx < 0) return false;
     var target;
     var mode = currentMode();
-    if (mode === 'shuffle' && favorites.length > 1) {
-      do {
-        target = Math.floor(Math.random() * favorites.length);
-      } while (target === idx);
+    if (mode === 'shuffle') {
+      target = getFavoriteShuffleIndex(dir);
+      if (target < 0) return false;
     } else {
       target = idx + dir;
       if (target < 0 || target >= favorites.length) {
@@ -2041,9 +2117,12 @@ body.dark-mode .card.fullscreen{
       toast('已收藏');
     }
     saveFavorites();
+    favoriteShuffleQueue = [];
+    favoriteShufflePos = -1;
     updateFavoriteButton();
     renderFavoritesCard();
     if (favoritesView) renderFavorites();
+    else updateChapterFavoriteMarks();
   }
   function playFavorite(fav, forceRestart) {
     var track = findTrackForFavorite(fav);
@@ -2052,7 +2131,10 @@ body.dark-mode .card.fullscreen{
     favoritesView = true;
     favoritesPlayback = true;
     var idx = indexOfFavorite(fav);
-    if (idx >= 0) preloadFavoritePair(idx);
+    if (idx >= 0) {
+      preloadFavoritePair(idx);
+      syncFavoriteShufflePosition(idx);
+    }
     if (switchingView) {
       renderTrackList();
       renderFavoritesCard();
@@ -2245,8 +2327,13 @@ body.dark-mode .card.fullscreen{
     modeIndex = (modeIndex + 1) % MODES.length;
     updateModeButton();
     toast(MODES[modeIndex].label);
-    if (currentMode() === 'shuffle' && currentChapters.length > 0) {
-      buildShuffleQueue(currentChapterIndex);
+    if (currentMode() === 'shuffle') {
+      if (favoritesPlayback) {
+        var favIdx = currentFavoriteIndex();
+        if (favIdx >= 0) buildFavoriteShuffleQueue(favIdx);
+        else { favoriteShuffleQueue = []; favoriteShufflePos = -1; }
+      }
+      if (currentChapters.length > 0) buildShuffleQueue(currentChapterIndex);
     }
     saveMode();
   });
@@ -2530,7 +2617,9 @@ body.dark-mode .card.fullscreen{
     chapterEmptyEl.style.display = 'none';
     currentChapters.forEach(function (ch, index) {
       var li = document.createElement('li');
-      li.className = 'chapter-item' + (index === currentChapterIndex ? ' active' : '');
+      li.className = 'chapter-item' +
+        (index === currentChapterIndex ? ' active' : '') +
+        (isChapterFavorited(currentTrackId, currentTrack ? currentTrack.src : '', ch.startMs) ? ' favorited' : '');
       var t = document.createElement('div');
       t.className = 'chapter-title';
       t.textContent = ch.title;
@@ -2549,6 +2638,17 @@ body.dark-mode .card.fullscreen{
       chapterListEl.appendChild(li);
     });
     updateChapterHighlight();
+  }
+
+  function updateChapterFavoriteMarks() {
+    if (favoritesView) return;
+    var items = chapterListEl.querySelectorAll('.chapter-item');
+    items.forEach(function (el, i) {
+      var ch = currentChapters[i];
+      if (!ch) return;
+      el.classList.toggle('favorited',
+        isChapterFavorited(currentTrackId, currentTrack ? currentTrack.src : '', ch.startMs));
+    });
   }
 
   function renderFavorites() {
