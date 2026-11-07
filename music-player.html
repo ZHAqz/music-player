@@ -983,6 +983,12 @@ body.dark-mode .card.fullscreen{
   var currentChapters = [];
   var currentChapterIndex = -1;
 
+  /* 右侧当前浏览的专辑，与正在播放的专辑分开 */
+  var viewTrackId = null;
+  var viewTrack = null;
+  var viewChapters = [];
+  var viewLoadToken = 0;
+
   var favorites = [];
   var favoritesView = false;
   var favoritesPlayback = false;
@@ -1046,6 +1052,7 @@ body.dark-mode .card.fullscreen{
   var isFading = false;
   var FADE_DURATION = 300;
   var chapterEndTimer = null;
+  var chapterEndRaf = 0;
 
   /* 拖动排序状态 */
   var pressState = null;
@@ -2130,8 +2137,9 @@ body.dark-mode .card.fullscreen{
     var track = findTrackForFavorite(fav);
     if (!track) { toast('该收藏的专辑文件已不在列表中'); return false; }
     if (!fromQueue) sleepStopRequested = false;
-    var switchingView = !favoritesView;
-    favoritesView = true;
+    var wasFavoritesView = favoritesView;
+    if (!fromQueue) favoritesView = true;
+    var switchingView = favoritesView && !wasFavoritesView;
     favoritesPlayback = true;
     var idx = indexOfFavorite(fav);
     if (idx >= 0) {
@@ -2163,7 +2171,6 @@ body.dark-mode .card.fullscreen{
   favBtn.addEventListener('click', toggleCurrentFavorite);
   favoritesCard.addEventListener('click', function () {
     favoritesView = true;
-    favoritesPlayback = currentFavoriteIndex() >= 0;
     renderTrackList();
     renderRightPanel();
     if (favorites.length) preloadFavoritePair(0);
@@ -2208,8 +2215,9 @@ body.dark-mode .card.fullscreen{
       if (t.kind === 'url') saveStore();
       favorites.forEach(function (f) {
         if (f.trackId === id) f.trackName = val;
-        if (f.trackId === id && Math.abs(f.startMs) < 1 && currentTrackId === id &&
-            currentChapters.length === 1 && currentChapters[0].virtual) {
+        if (f.trackId === id && Math.abs(f.startMs) < 1 &&
+            ((currentTrackId === id && currentChapters.length === 1 && currentChapters[0].virtual) ||
+             (viewTrackId === id && viewChapters.length === 1 && viewChapters[0].virtual))) {
           f.title = val;
         }
       });
@@ -2221,6 +2229,10 @@ body.dark-mode .card.fullscreen{
           nowPlayingEl.textContent = val;
           updateMediaSession(val, val);
         }
+      }
+      if (viewTrackId === id && viewChapters.length === 1 && viewChapters[0].virtual) {
+        viewChapters[0].title = val;
+        renderRightPanel();
       }
       renderTrackList();
     }
@@ -2593,7 +2605,7 @@ body.dark-mode .card.fullscreen{
     listEl.innerHTML = '';
     tracks.forEach(function (t) {
       var li = document.createElement('li');
-      li.className = 'item' + (!favoritesView && t.id === currentTrackId ? ' active' : '');
+      li.className = 'item' + (!favoritesView && t.id === viewTrackId ? ' active' : '');
       li.setAttribute('data-id', t.id);
 
       var info = document.createElement('div');
@@ -2629,10 +2641,7 @@ body.dark-mode .card.fullscreen{
       });
       li.addEventListener('click', function () {
         if (suppressClick) { suppressClick = false; return; }
-        sleepStopRequested = false;
-        favoritesView = false;
-        favoritesPlayback = false;
-        loadAlbum(t.id);
+        loadViewedAlbum(t.id);
       });
       listEl.appendChild(li);
     });
@@ -2646,21 +2655,26 @@ body.dark-mode .card.fullscreen{
 
   function renderChapters() {
     chapterTitleEl.textContent = '歌曲列表';
-    chapterCountEl.textContent = currentChapters.length;
+    chapterCountEl.textContent = viewChapters.length;
     chapterListEl.innerHTML = '';
-    if (!currentChapters.length) {
+    if (!viewChapters.length) {
       chapterEmptyEl.style.display = 'block';
-      chapterEmptyEl.textContent = currentTrackId
+      chapterEmptyEl.textContent = viewTrackId
         ? '当前专辑正在加载歌曲…'
         : '点击专辑文件后，若包含歌曲信息会显示在这里';
       return;
     }
     chapterEmptyEl.style.display = 'none';
-    currentChapters.forEach(function (ch, index) {
+    viewChapters.forEach(function (ch, index) {
+      var playing = false;
+      if (viewTrackId && viewTrackId === currentTrackId) {
+        var ci = findChapterIndex(currentChapters, ch.startMs);
+        playing = ci >= 0 && ci === currentChapterIndex;
+      }
       var li = document.createElement('li');
       li.className = 'chapter-item' +
-        (index === currentChapterIndex ? ' active' : '') +
-        (isChapterFavorited(currentTrackId, currentTrack ? currentTrack.src : '', ch.startMs) ? ' favorited' : '');
+        (playing ? ' active' : '') +
+        (isChapterFavorited(viewTrackId, viewTrack ? viewTrack.src : '', ch.startMs) ? ' favorited' : '');
       var t = document.createElement('div');
       t.className = 'chapter-title';
       t.textContent = ch.title;
@@ -2674,7 +2688,7 @@ body.dark-mode .card.fullscreen{
       li.appendChild(t);
       li.appendChild(tm);
       li.addEventListener('click', function () {
-        onChapterClick(index);
+        onViewedChapterClick(index);
       });
       chapterListEl.appendChild(li);
     });
@@ -2685,10 +2699,10 @@ body.dark-mode .card.fullscreen{
     if (favoritesView) return;
     var items = chapterListEl.querySelectorAll('.chapter-item');
     items.forEach(function (el, i) {
-      var ch = currentChapters[i];
+      var ch = viewChapters[i];
       if (!ch) return;
       el.classList.toggle('favorited',
-        isChapterFavorited(currentTrackId, currentTrack ? currentTrack.src : '', ch.startMs));
+        isChapterFavorited(viewTrackId, viewTrack ? viewTrack.src : '', ch.startMs));
     });
   }
 
@@ -2741,9 +2755,18 @@ body.dark-mode .card.fullscreen{
   }
 
   function updateChapterHighlight() {
+    var sameAlbum = !!(viewTrackId && viewTrackId === currentTrackId);
     var items = chapterListEl.querySelectorAll('.chapter-item');
     items.forEach(function (el, i) {
-      el.classList.toggle('active', i === currentChapterIndex);
+      var on = false;
+      if (sameAlbum) {
+        var vch = viewChapters[i];
+        if (vch) {
+          var ci = findChapterIndex(currentChapters, vch.startMs);
+          on = ci >= 0 && ci === currentChapterIndex;
+        }
+      }
+      el.classList.toggle('active', on);
     });
   }
 
@@ -3083,10 +3106,61 @@ body.dark-mode .card.fullscreen{
     playChapter(index, true);
   }
 
+  function onViewedChapterClick(index) {
+    if (favoritesView || !viewTrackId) return;
+    var vch = viewChapters[index];
+    if (!vch) return;
+    sleepStopRequested = false;
+    if (viewTrackId === currentTrackId && currentChapters.length) {
+      var ci = findChapterIndex(currentChapters, vch.startMs);
+      if (ci >= 0) {
+        if (ci === currentChapterIndex) {
+          onChapterClick(ci);
+          return;
+        }
+        favoritesPlayback = false;
+        playChapter(ci, true);
+        return;
+      }
+    }
+    favoritesPlayback = false;
+    loadAlbum(viewTrackId, vch.startMs);
+  }
+
+  async function loadViewedAlbum(trackId) {
+    var t = findTrack(trackId);
+    if (!t) return;
+    closeItemMenu();
+    var token = ++viewLoadToken;
+    favoritesView = false;
+    viewTrackId = trackId;
+    viewTrack = t;
+    viewChapters = [];
+    renderTrackList();
+    renderRightPanel();
+
+    var parsed = await loadChaptersCached(t);
+    if (token !== viewLoadToken || favoritesView || viewTrackId !== trackId) return;
+
+    if (parsed.length > 0) {
+      viewChapters = parsed;
+    } else {
+      viewChapters = [{ title: t.name, startMs: 0, endMs: null, virtual: true }];
+    }
+    renderRightPanel();
+  }
+
   async function loadAlbum(trackId, targetStartMs) {
     var t = findTrack(trackId);
     if (!t) return;
     var token = ++albumLoadToken;
+    var adoptView = !favoritesView && !viewTrackId;
+    if (adoptView) {
+      viewLoadToken++;
+      viewTrackId = trackId;
+      viewTrack = t;
+      viewChapters = [];
+    }
 
     cancelFade();
     closeItemMenu();
@@ -3110,9 +3184,13 @@ body.dark-mode .card.fullscreen{
     playBtn.innerHTML = SVG_PLAY;
     playBtn.setAttribute('aria-label', '播放');
 
-    if (!favoritesView) {
+    if (adoptView) {
       renderTrackList();
       renderRightPanel();
+    }
+    if (!favoritesView) {
+      updateChapterHighlight();
+      updateFavoriteButton();
     } else {
       updateFavoriteHighlight();
       updateFavoriteButton();
@@ -3145,8 +3223,18 @@ body.dark-mode .card.fullscreen{
     if (favoritesView) {
       updateFavoriteHighlight();
       updateFavoriteButton();
+    } else if (viewTrackId === trackId) {
+      var needRender = viewChapters.length !== currentChapters.length;
+      viewChapters = currentChapters;
+      if (needRender) {
+        renderRightPanel();
+      } else {
+        updateChapterHighlight();
+        updateFavoriteButton();
+      }
     } else {
-      renderRightPanel();
+      updateChapterHighlight();
+      updateFavoriteButton();
     }
     playChapter(startIndex, true);
   }
@@ -3170,6 +3258,8 @@ body.dark-mode .card.fullscreen{
 
     function apply() {
       seekingByChapter = true;
+      /* 平板上正在播放时直接 seek 可能仍会先送出旧缓冲；先暂停再定位 */
+      if (!audio.paused && isTouchDevice()) audio.pause();
       audio.currentTime = startSec;
       audio.volume = savedVolume / 100;
       setTimeout(function () { seekingByChapter = false; }, 120);
@@ -3199,7 +3289,12 @@ body.dark-mode .card.fullscreen{
       if (favoritesView && favorites.length && playFavorite(favorites[0])) return;
       favoritesView = false;
       favoritesPlayback = false;
-      renderFavoritesCard();
+      renderTrackList();
+      if (viewTrackId) {
+        renderRightPanel();
+        loadAlbum(viewTrackId, 0);
+        return;
+      }
       renderRightPanel();
       if (tracks.length) loadAlbum(tracks[0].id);
       else toast('列表是空的');
@@ -3336,6 +3431,12 @@ body.dark-mode .card.fullscreen{
     if (t.kind === 'url') saveStore();
     delete chapterCache[id];
     delete chapterLoads[id];
+    if (viewTrackId === id) {
+      viewLoadToken++;
+      viewTrackId = null;
+      viewTrack = null;
+      viewChapters = [];
+    }
 
     if (currentTrackId === id) {
       favoritesPlayback = false;
@@ -3375,11 +3476,19 @@ body.dark-mode .card.fullscreen{
   }
 
   /* timeupdate 在部分浏览器只有约 4Hz，等它发现章节结束时已经播进下一首了；
-     用 30ms 的轻量轮询提前在边界前切歌，避免下一首开头混进结尾 */
+     用 rAF（约 60Hz）提前在边界前切歌，setInterval 只作为后台/降级兜底 */
+  function isTouchDevice() {
+    if (window.matchMedia && window.matchMedia('(any-pointer: coarse)').matches) return true;
+    return window.innerWidth <= 820;
+  }
   function stopChapterEndMonitor() {
     if (chapterEndTimer) {
       clearInterval(chapterEndTimer);
       chapterEndTimer = null;
+    }
+    if (chapterEndRaf) {
+      cancelAnimationFrame(chapterEndRaf);
+      chapterEndRaf = 0;
     }
   }
   function checkChapterEnd() {
@@ -3389,9 +3498,18 @@ body.dark-mode .card.fullscreen{
     if (!isFinite(endSec)) return;
     if (audio.currentTime >= endSec - 0.05) handleChapterEnded();
   }
+  function chapterEndRafTick() {
+    chapterEndRaf = 0;
+    if (audio.paused) return;
+    checkChapterEnd();
+    if (chapterEndTimer && !audio.paused) {
+      chapterEndRaf = requestAnimationFrame(chapterEndRafTick);
+    }
+  }
   function startChapterEndMonitor() {
     stopChapterEndMonitor();
-    chapterEndTimer = setInterval(checkChapterEnd, 30);
+    chapterEndTimer = setInterval(checkChapterEnd, 50);
+    chapterEndRaf = requestAnimationFrame(chapterEndRafTick);
   }
 
   function updateProgressUI() {
@@ -3422,8 +3540,11 @@ body.dark-mode .card.fullscreen{
     startChapterEndMonitor();
     requestWakeLock();
   });
+  audio.addEventListener('playing', function () {
+    startChapterEndMonitor();
+  });
   audio.addEventListener('pause', function () {
-    stopChapterEndMonitor();
+    if (audio.paused) stopChapterEndMonitor();
     recordIcon.classList.remove('playing');
     playBtn.innerHTML = SVG_PLAY;
     playBtn.setAttribute('aria-label', '播放');
@@ -3503,8 +3624,22 @@ body.dark-mode .card.fullscreen{
       if (!isFinite(endSec)) { seekDragging = false; return; }
       var dur = endSec - startSec;
       if (dur > 0) {
+        var target = startSec + dur * progressEl.value / 1000;
+        if (target >= endSec - 0.05) {
+          seekDragging = false;
+          seekingByChapter = false;
+          if (audio.paused) {
+            audio.currentTime = endSec;
+            updateProgressUI();
+          } else {
+            audio.pause();
+            chapterEndedHandled = false;
+            handleChapterEnded();
+          }
+          return;
+        }
         seekingByChapter = true;
-        audio.currentTime = startSec + dur * progressEl.value / 1000;
+        audio.currentTime = target;
         setTimeout(function () { seekingByChapter = false; }, 120);
       }
     } else if (isFinite(audio.duration) && audio.duration > 0) {
@@ -3598,6 +3733,20 @@ body.dark-mode .card.fullscreen{
       try {
         navigator.mediaSession.setActionHandler('seekto', function (d) {
           if (!d || typeof d.seekTime !== 'number') return;
+          if (currentChapterIndex >= 0 && currentChapters.length > 0) {
+            var endSec = getChapterEndSec(currentChapterIndex);
+            if (isFinite(endSec) && d.seekTime >= endSec - 0.05) {
+              if (audio.paused) {
+                audio.currentTime = endSec;
+                updateProgressUI();
+              } else {
+                audio.pause();
+                chapterEndedHandled = false;
+                handleChapterEnded();
+              }
+              return;
+            }
+          }
           audio.currentTime = d.seekTime;
         });
       } catch (e2) {}
